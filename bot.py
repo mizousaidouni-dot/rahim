@@ -1,15 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 بوت تيليجرام لتوقيع وتوزيع ملفات IPA عبر رابط OTA (itms-services)
-
-التثبيت على السيرفر:
-    pip install "python-telegram-bot[job-queue]" aiohttp cryptography
-    + تثبيت zsign على السيرفر (وضعه في PATH أو غيّر ZSIGN_PATH)
-    + openssl (لقراءة تاريخ انتهاء البروفايل)
-    + نطاق HTTPS (توفره الاستضافة تلقائياً عند النشر بـ Docker)
-
-التشغيل:
-    python bot.py
+يدعم رفع ملفات حتى 1 جيجابايت + إرسال تقارير الأخطاء للمالك تلقائياً.
 """
 
 import asyncio
@@ -19,6 +11,7 @@ import plistlib
 import secrets
 import sqlite3
 import subprocess
+import traceback
 import zipfile
 from datetime import datetime, timedelta
 from functools import wraps
@@ -28,16 +21,22 @@ from cryptography.fernet import Fernet
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
+from telethon import TelegramClient
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║                  الإعدادات (عدّل هنا)                      ║
 # ╚══════════════════════════════════════════════════════════╝
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9064582501:AAGZEZyw4iKBoGb77EuUePIrip9CWjnSN6c")   # ← ضع توكن البوت هنا (من @BotFather)
-OWNER_ID = int(os.getenv("OWNER_ID", "7788474071"))                # ← ضع رقمك هنا (من @userinfobot)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9064582501:AAGZEZyw4iKBoGb77EuUePIrip9CWjnSN6c")
+OWNER_ID = int(os.getenv("OWNER_ID", "7788474071"))
 
-# ─── لا تحتاج تعديل ما بعد هذا السطر (إلا إذا أردت) ───
+# بيانات MTProto لتحميل الملفات الكبيرة حتى 1GB (احصل عليها من my.telegram.org)
+API_ID = int(os.getenv("API_ID", "39688640"))
+API_HASH = os.getenv("API_HASH", "78e7fa93ba42cadd097c01c5069ee40b")
+
+MAX_FILE_SIZE_MB = 1024  # الحد الأقصى 1 جيجابايت (1024 ميجابايت)
+
+
 def _detect_base_url():
-    """يكتشف رابط الموقع تلقائياً من متغيرات الاستضافة، أو من BASE_URL."""
     u = os.getenv("BASE_URL")
     if u:
         return u.rstrip("/")
@@ -46,31 +45,31 @@ def _detect_base_url():
         v = os.getenv(var)
         if v:
             return (v if v.startswith("http") else "https://" + v).rstrip("/")
-    return "https://yourdomain.com"   # ← ضع رابط استضافتك هنا إن لم يُكتشف تلقائياً
+    return "https://yourdomain.com"
+
 
 BASE_URL = _detect_base_url()
 PORT = int(os.getenv("PORT", "8080"))
 ZSIGN_PATH = os.getenv("ZSIGN_PATH", "zsign")
-DATA_DIR = os.getenv("DATA_DIR", "data")      # مجلد البيانات (إن وفّرت الاستضافة قرصاً دائماً وجّهه إليه)
+DATA_DIR = os.getenv("DATA_DIR", "data")
 STORAGE_DIR = f"{DATA_DIR}/storage"
 DB_FILE = f"{DATA_DIR}/bot.db"
 KEY_FILE = f"{DATA_DIR}/.secret.key"
 EXPIRY_CHECK_HOURS = 6
 FREE_ACCOUNT_DAYS = 7
 
-# ═══════════════════ نصوص الواجهة (عدّل كما تشاء) ═══════════════════
 T = {
     "welcome": "أهلاً بك 👋\nاختر من القائمة:",
     "no_perm": "⛔ ليست لديك صلاحية",
-    "send_ipa": "📱 أرسل الآن ملف الـ IPA:",
+    "send_ipa": f"📱 أرسل الآن ملف الـ IPA (الحد الأقصى {MAX_FILE_SIZE_MB} ميجابايت):",
     "not_ipa": "أرسل ملف بصيغة .ipa فقط",
+    "too_big": f"⚠️ حجم الملف يتجاوز الحد الأقصى المسموح به ({MAX_FILE_SIZE_MB} ميجابايت / 1 جيجابايت).",
     "no_accounts": "⚠️ لا توجد حسابات صالحة حالياً. تواصل مع المشرف.",
     "choose_account": "اختر الحساب للتوقيع:",
     "signing": "⏳ جاري التوقيع...",
     "sign_fail": "❌ فشل التوقيع:\n",
     "signed_ok": "✅ تم التوقيع!\nافتح الرابط من الآيفون (Safari) ثم اضغط تثبيت:",
 }
-# ═══════════════════════════════════════════════════════════════
 
 os.makedirs(STORAGE_DIR, exist_ok=True)
 os.makedirs(f"{STORAGE_DIR}/ipa_original", exist_ok=True)
@@ -94,7 +93,7 @@ def dec(s: str) -> str:
 
 
 # ───────────────────────── قاعدة البيانات ─────────────────────────
-db = sqlite3.connect(DB_FILE)
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.executescript("""
 CREATE TABLE IF NOT EXISTS admins (
@@ -166,7 +165,6 @@ def role(uid):
 
 
 def require(*allowed):
-    """تحقق من الصلاحية داخل كل دالة (لا تكتفِ بإخفاء الأزرار)."""
     def deco(fn):
         @wraps(fn)
         async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *a, **kw):
@@ -179,6 +177,23 @@ def require(*allowed):
             return await fn(update, ctx, *a, **kw)
         return wrapper
     return deco
+
+
+# ───────────────────────── عميل Telethon للملفات الكبيرة ─────────────────────────
+tg_client: TelegramClient | None = None
+
+
+async def download_large_file(chat_id: int, message_id: int, dest_path: str, doc):
+    """يحمل الملف عبر API العادي إذا كان أقل من 19MB، أو عبر Telethon حتى 1GB."""
+    size_mb = (doc.file_size or 0) / (1024 * 1024)
+    if size_mb <= 19 or tg_client is None:
+        f = await doc.get_file()
+        await f.download_to_drive(dest_path)
+    else:
+        msg = await tg_client.get_messages(chat_id, ids=message_id)
+        if not msg or not msg.media:
+            raise RuntimeError("تعذر الوصول إلى الملف عبر MTProto لتحميله.")
+        await tg_client.download_media(msg, file=dest_path)
 
 
 # ───────────────────────── القوائم ─────────────────────────
@@ -205,7 +220,6 @@ def back_home():
 
 # ───────────────────────── أدوات IPA والتوقيع ─────────────────────────
 def read_ipa_info(path):
-    """يقرأ الاسم والـ bundle id والإصدار من داخل IPA."""
     try:
         with zipfile.ZipFile(path) as z:
             for n in z.namelist():
@@ -224,7 +238,6 @@ def read_ipa_info(path):
 
 
 def profile_expiry(profile_path):
-    """يقرأ تاريخ انتهاء mobileprovision (يحتاج openssl). عند الفشل: الآن + 7 أيام."""
     try:
         out = subprocess.run(
             ["openssl", "smime", "-inform", "der", "-verify", "-noverify", "-in", profile_path],
@@ -243,11 +256,10 @@ async def run_zsign(ipa, p12, password, profile, out):
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     so, se = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError((se or so).decode(errors="ignore")[-500:])
+        raise RuntimeError((se or so).decode(errors="ignore")[-800:])
 
 
 async def sign_app(app_id: int, account_id: int):
-    """يوقّع التطبيق بالحساب المحدد (ويُستخدم أيضاً لتغيير الحساب)."""
     app = db.execute("SELECT * FROM apps WHERE id=?", (app_id,)).fetchone()
     acc = db.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
     out = f"{STORAGE_DIR}/ipa_signed/{app['token']}.ipa"
@@ -305,7 +317,8 @@ async def h_health(request):
     return web.Response(text="OK")
 
 
-async def start_web(app: Application):
+async def post_init_tasks(app: Application):
+    global tg_client
     web_app = web.Application()
     web_app.add_routes([
         web.get("/ipa/{token}.ipa", h_ipa),
@@ -316,6 +329,34 @@ async def start_web(app: Application):
     runner = web.AppRunner(web_app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
+
+    if API_ID and API_HASH:
+        tg_client = TelegramClient(f"{DATA_DIR}/bot_session", API_ID, API_HASH)
+        await tg_client.start(bot_token=BOT_TOKEN)
+
+
+# ───────────────────────── معالج الأخطاء الشامل ─────────────────────────
+async def global_error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    err_trace = "".join(traceback.format_exception(type(ctx.error), ctx.error, ctx.error.__traceback__))
+    short_err = str(ctx.error)[:500]
+
+    if isinstance(update, Update):
+        target_msg = update.effective_message
+        if target_msg:
+            try:
+                await target_msg.reply_text(f"❌ حدث خطأ أثناء المعالجة:\n`{short_err}`", parse_mode="Markdown")
+            except Exception:
+                pass
+
+    if OWNER_ID:
+        report = (
+            f"🚨 **تقرير خطأ في البوت:**\n"
+            f"```python\n{err_trace[-3500:]}\n```"
+        )
+        try:
+            await ctx.bot.send_message(chat_id=OWNER_ID, text=report, parse_mode="Markdown")
+        except Exception:
+            await ctx.bot.send_message(chat_id=OWNER_ID, text=f"🚨 خطأ:\n{err_trace[-3800:]}")
 
 
 # ───────────────────────── المعالجات: عام ─────────────────────────
@@ -344,11 +385,25 @@ async def receive_ipa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc or not (doc.file_name or "").lower().endswith(".ipa"):
         return await update.message.reply_text(T["not_ipa"])
-    msg = await update.message.reply_text("⬇️ جاري تحميل الملف...")
+
+    size_mb = (doc.file_size or 0) / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        return await update.message.reply_text(T["too_big"])
+
+    if size_mb > 19 and tg_client is None:
+        return await update.message.reply_text(
+            "⚠️ الملف أكبر من 20 ميجابايت، يرجى إضافة API_ID و API_HASH في إعدادات الاستضافة لتفعيل التحميل حتى 1 جيجابايت."
+        )
+
+    msg = await update.message.reply_text(f"⬇️ جاري تحميل الملف ({size_mb:.1f} MB)...")
     uid = update.effective_user.id
     path = f"{STORAGE_DIR}/ipa_original/{uid}_{secrets.token_hex(4)}_{doc.file_name}"
-    f = await doc.get_file()
-    await f.download_to_drive(path)
+
+    try:
+        await download_large_file(update.effective_chat.id, update.message.message_id, path, doc)
+    except Exception as e:
+        return await msg.edit_text(f"❌ فشل تحميل الملف من تيليجرام:\n{str(e)[:400]}", reply_markup=back_home())
+
     info = read_ipa_info(path)
     ctx.user_data["pending"] = {"path": path, **info}
     ctx.user_data["state"] = None
@@ -374,7 +429,7 @@ async def do_sign_new(q, ctx, account_id):
     try:
         await sign_app(cur.lastrowid, account_id)
     except Exception as e:
-        return await q.edit_message_text(T["sign_fail"] + str(e)[:400], reply_markup=back_home())
+        return await q.edit_message_text(T["sign_fail"] + str(e)[:600], reply_markup=back_home())
     ctx.user_data.pop("pending", None)
     await q.edit_message_text(
         f"{T['signed_ok']}\n\n{install_page_url(token)}", reply_markup=back_home())
@@ -426,7 +481,7 @@ async def resign_do(q, ctx, app_id, account_id):
     try:
         await sign_app(app_id, account_id)
     except Exception as e:
-        return await q.edit_message_text(T["sign_fail"] + str(e)[:400], reply_markup=back_home())
+        return await q.edit_message_text(T["sign_fail"] + str(e)[:600], reply_markup=back_home())
     await q.edit_message_text(f"✅ تم التوقيع بالحساب الجديد.\n\n{install_page_url(a['token'])}",
                               reply_markup=back_home())
 
@@ -523,7 +578,6 @@ async def remove_admin(update, ctx, uid):
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     d = q.data
-    uid = q.from_user.id
 
     if d == "noop":
         return await q.answer()
@@ -548,7 +602,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if d.startswith("delapp_"):
         return await delete_app(q, ctx, int(d.split("_")[1]))
 
-    # الحسابات
     if d == "accounts":
         return await accounts_menu(update, ctx)
     if d == "add_account":
@@ -556,7 +609,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if d.startswith("delacc_"):
         return await delete_account(update, ctx, int(d.split("_")[1]))
 
-    # المشرفون
     if d == "admins":
         return await admins_menu(update, ctx)
     if d == "add_admin":
@@ -574,11 +626,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state = ctx.user_data.get("state")
     r = role(uid)
 
-    # رفع IPA (أي مستخدم)
     if state == "awaiting_ipa":
         return await receive_ipa(update, ctx)
 
-    # إضافة مشرف (مالك فقط)
     if state == "awaiting_admin" and r == "owner":
         origin = getattr(msg, "forward_origin", None)
         if origin is not None and getattr(origin, "sender_user", None):
@@ -595,7 +645,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.clear()
         return await msg.reply_text("✅ تمت إضافة المشرف.", reply_markup=main_menu(uid))
 
-    # إضافة حساب (مالك + مشرف)
     if r in ("owner", "admin") and state in ("awaiting_p12", "awaiting_p12_pass", "awaiting_profile"):
         acc = ctx.user_data.setdefault("new_acc", {})
 
@@ -639,7 +688,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"✅ تمت إضافة الحساب «{acc['name']}»\nتنتهي بعد {max((expiry - now()).days, 0)} يوم.",
                 reply_markup=main_menu(uid))
 
-    # لا حالة نشطة
     await msg.reply_text(T["welcome"], reply_markup=main_menu(uid))
 
 
@@ -665,10 +713,11 @@ async def check_expiry(ctx: ContextTypes.DEFAULT_TYPE):
 
 # ───────────────────────── التشغيل ─────────────────────────
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(start_web).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init_tasks).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
+    app.add_error_handler(global_error_handler)
     app.job_queue.run_repeating(check_expiry, interval=EXPIRY_CHECK_HOURS * 3600, first=60)
     app.run_polling()
 
