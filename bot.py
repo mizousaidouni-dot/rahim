@@ -32,8 +32,8 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 # ╔══════════════════════════════════════════════════════════╗
 # ║                  الإعدادات (عدّل هنا)                      ║
 # ╚══════════════════════════════════════════════════════════╝
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")   # ← ضع توكن البوت هنا (من @BotFather)
-OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))                # ← ضع رقمك هنا (من @userinfobot)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9064582501:AAGZEZyw4iKBoGb77EuUePIrip9CWjnSN6c")   # ← ضع توكن البوت هنا (من @BotFather)
+OWNER_ID = int(os.getenv("OWNER_ID", "7788474071"))                # ← ضع رقمك هنا (من @userinfobot)
 
 # ─── لا تحتاج تعديل ما بعد هذا السطر (إلا إذا أردت) ───
 def _detect_base_url():
